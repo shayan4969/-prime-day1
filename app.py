@@ -24,7 +24,7 @@ QUERY_TEMPLATES = [
     "{q} alternative",
 ]
 
-HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
+HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9", "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
 
 ALLOWLIST_DOMAINS = set([
     # Common electronics resources (best-effort; we still allow all, but we prioritize these)
@@ -108,6 +108,15 @@ def fetch_text_from_url(url: str) -> str:
         return ""
 
 
+def fetch_html(url: str) -> str:
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT_SECS)
+        resp.raise_for_status()
+        return resp.text
+    except Exception:
+        return ""
+
+
 def extract_candidate_parts(text: str, original_part: str):
     found = []
     original_up = normalize_part(original_part)
@@ -146,6 +155,42 @@ def extract_candidate_parts(text: str, original_part: str):
     return counts
 
 
+def gather_from_alltransistors(part_number: str) -> Counter:
+    counts = Counter()
+    search_url = f"https://alltransistors.com/search.php?search={quote_plus(part_number)}"
+    html = fetch_html(search_url)
+    if not html:
+        return counts
+    soup = BeautifulSoup(html, "lxml")
+    # Find first transistor page link
+    page_url = None
+    for a in soup.select('a[href*="transistor.php?transistor="]'):
+        name = (a.get_text(strip=True) or "").upper()
+        if looks_like_part(name) and part_number.upper().split()[0] in name:
+            page_url = a.get("href")
+            if page_url and page_url.startswith("/"):
+                page_url = f"https://alltransistors.com{page_url}"
+            break
+    if not page_url:
+        # fallback: take any first matching link
+        a = soup.select_one('a[href*="transistor.php?transistor="]')
+        if a:
+            u = a.get("href", "")
+            page_url = f"https://alltransistors.com{u}" if u.startswith("/") else u
+    if not page_url:
+        return counts
+
+    detail_html = fetch_html(page_url)
+    if not detail_html:
+        return counts
+    dsoup = BeautifulSoup(detail_html, "lxml")
+    for a in dsoup.select('a[href*="transistor.php?transistor="]'):
+        token = (a.get_text(strip=True) or "").upper()
+        if token and token != part_number.upper() and looks_like_part(token):
+            counts[token] += 3  # give stronger weight to curated links on AT
+    return counts
+
+
 def gather_alternatives(part_number: str):
     aggregated = Counter()
     sources = {}
@@ -180,6 +225,13 @@ def gather_alternatives(part_number: str):
                     sources.setdefault(token, set()).add(url)
             fetched_pages += 1
             time.sleep(0.2)  # be polite
+
+    # Direct provider fallbacks (no search engine required)
+    at_counts = gather_from_alltransistors(part_number)
+    if at_counts:
+        aggregated.update(at_counts)
+        for token in at_counts.keys():
+            sources.setdefault(token, set()).add("https://alltransistors.com/")
 
     # Prepare ranked list
     suggestions = []
